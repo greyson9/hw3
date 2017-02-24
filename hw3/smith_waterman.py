@@ -1,6 +1,30 @@
 # hw3.py
 # implementation of the smith-waterman algorithm
 import numpy as np
+import itertools
+import time
+import string
+
+
+# read in the contents of a .fa file and return the sequence
+def fa_to_seq(filename):
+    out = ''
+    with open(filename, 'r') as f:
+        for line in f:
+            if line[0] != '>':
+                out += line.strip()
+    out = out.translate({ord(i):None for i in 'x'})
+    return out
+
+
+# read in a pair file and return a list of associated filenames
+def pair_to_fn(filename):
+    out_mat = []
+    with open(filename, 'r') as f:
+        for line in f:
+            _ = line.split()
+            out_mat.append(('./hw3/'+_[0], './hw3/'+_[1]))
+    return out_mat
 
 
 # read in a substitution matrix formatted in the standard way
@@ -43,8 +67,9 @@ def read_sub_mat(filename):
 #    row shifts represent a gap in sequence 1
 # column shifts represent a gap in sequence 2
 #    to check if a gap is an extension or an opening,
-# look at the adjacent cells to see if they are the result of
-# a substitution or a gap opening.  If the latter, extend.
+# look at the traceback matrix corresponding to the adjacent cells
+# to see if they are the result of a substitution or a gap opening.
+# If the latter, extend. Else, open a gap.
 def smith_waterman(s1, s2, sub_mat, gap_open, gap_extension):
     if len(s1) == 0 or len(s2) == 0:
         return [list(s1), list(s2)]
@@ -105,8 +130,8 @@ def smith_waterman(s1, s2, sub_mat, gap_open, gap_extension):
     alignment[0].reverse()
     alignment[1].reverse()
 #     print(trace_mat)
-#     print(score_mat)
     return np.amax(score_mat), alignment
+#     return np.amax(score_mat)/min(len(s1), len(s2)), alignment
 
 
 # calculate the local alignment score threshold which gives
@@ -130,3 +155,78 @@ def find_tp_thresh(pos_arr, neg_arr):
     print(best_fpr)
     print(best_tpr)
     return thresh, diff, best_fpr, best_tpr
+
+
+# Use simulated annealing to optimize substitution matrix
+# A candidate matrix is the last selected matrix with entries increased by a random quantity
+# between 0 and 1, if there is a higher frequency of substitution for the corresponding
+# amino acids in the positive alignment set than the negative alignment set.
+#
+# At each step of the annealing schedule, construct a candidate matrix
+# Compute the scores of the old and new matrices (sum of TPR for FPRS of 0, 0.1, 0.2, 0.3)
+# If the score of the new matrix is greater than the old matrix, set the old matrix to the new one and iterate
+# If the score of the new matrix is less than the old matrix, calculate prob = exp((new - old) / temp)
+# If prob > a random draw between 0 and 1, accept the new matrix and iterate
+# Otherwise, keep the old matrix and iterate
+def optimize_matrix(start_mat, mat_to_opt):
+    pos_aligns = [smith_waterman(fa_to_seq(x[0]), fa_to_seq(x[1]), start_mat, 13, 3)[1] for x in pair_to_fn('./hw3/Pospairs.txt')]
+    neg_aligns = [smith_waterman(fa_to_seq(x[0]), fa_to_seq(x[1]), start_mat, 13, 3)[1] for x in pair_to_fn('./hw3/Negpairs.txt')]
+    freqs = {x: {y: [0, 0, 0] for y in read_sub_mat('./hw3/PAM100').keys()} for x in read_sub_mat('./hw3/PAM100').keys()}
+    for align in pos_aligns:
+        s1 = align[0]
+        s2 = align[1]
+        for char1, char2 in zip(s1, s2):
+            if char1 != '-' and char2 != '-':
+                freqs[char1][char2][0] += 1
+                freqs[char2][char1][0] += 1
+    for align in neg_aligns:
+        s1 = align[0]
+        s2 = align[1]
+        for char1, char2 in zip(s1, s2):
+            if char1 != '-' and char2 != '-':
+                freqs[char1][char2][1] += 1
+                freqs[char2][char1][1] += 1
+    for a1 in freqs.keys():
+        pos_subs = sum([freqs[a1][x][0] for x in freqs[a1].keys()])
+        neg_subs = sum([freqs[a1][x][1] for x in freqs[a1].keys()])
+        for a2 in freqs.keys():
+            if pos_subs > 0:
+                if neg_subs > 0:
+                    freqs[a1][a2][2] = freqs[a1][a2][0] / pos_subs - freqs[a1][a2][1] / neg_subs
+                    freqs[a2][a1][2] = freqs[a1][a2][2]
+                else:
+                    freqs[a1][a2][2] = freqs[a1][a2][0] / pos_subs
+                    freqs[a2][a1][2] = freqs[a1][a2][2]
+
+
+
+    old_mat = mat_to_opt
+    sorted_pos = np.sort(np.asarray([smith_waterman(fa_to_seq(x[0]), fa_to_seq(x[1]), old_mat, 13, 3)[0] for x in pair_to_fn('./hw3/Pospairs.txt')]))
+    sorted_neg = np.sort(np.asarray([smith_waterman(fa_to_seq(x[0]), fa_to_seq(x[1]), old_mat, 13, 3)[0] for x in pair_to_fn('./hw3/Negpairs.txt')]))
+    old_score = (len(sorted_pos[sorted_pos > sorted_neg[49]]) + len(sorted_pos[sorted_pos > sorted_neg[44]])
+                 + len(sorted_pos[sorted_pos > sorted_neg[39]]) + len(sorted_pos[sorted_pos > sorted_neg[34]])
+                ) / len(sorted_pos)
+    # warming then cooling gives annealing schedule
+    temp_sched = [4 * ((1.1) ** n) for n in range(0, 10)]
+    temp_sched.extend([temp_sched[-1] * ((0.95) ** n) for n in range(0, 1000)])
+    # testing annealing
+    # temp_sched = [9 * ((1.1) ** n) for n in range(0, 2)]
+    # temp_sched.extend([temp_sched[-1] * ((0.9) ** n) for n in range(0, 2)])
+    for temp in temp_sched:
+        # adjust each member of old matrix by random number, with sign derived from static aligned sequences
+        new_mat = {x: {
+            y: old_mat[x][y] + np.sign(freqs[x][y][2]) * np.random.rand(1, 1)[0][0] for y in old_mat[x].keys()
+        } for x in old_mat.keys()}
+
+        sorted_pos = np.sort(np.asarray([smith_waterman(
+            fa_to_seq(x[0]), fa_to_seq(x[1]), new_mat, gap_open, gap_extend)[0] for x in pair_to_fn('./hw3/Pospairs.txt')]))
+        sorted_neg = np.sort(np.asarray([smith_waterman(
+            fa_to_seq(x[0]), fa_to_seq(x[1]), new_mat, gap_open, gap_extend)[0] for x in pair_to_fn('./hw3/Negpairs.txt')]))
+        new_score = (len(sorted_pos[sorted_pos > sorted_neg[49]]) + len(sorted_pos[sorted_pos > sorted_neg[44]])
+                     + len(sorted_pos[sorted_pos > sorted_neg[39]]) + len(sorted_pos[sorted_pos > sorted_neg[34]])
+                    ) / len(sorted_pos)
+        prob = min(1, np.exp(-(old_score - new_score) / temp))
+        if prob > np.random.rand(1, 1)[0][0]:
+            old_score = new_score
+            old_mat = new_mat
+    return old_mat
